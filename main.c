@@ -72,7 +72,6 @@ main (int argc, char *argv[])
       }
     }
 
-  mm_monitor_stop (media_monitor);
   mm_monitor_free (media_monitor);
 
   return EXIT_SUCCESS;

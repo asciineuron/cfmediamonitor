@@ -23,29 +23,29 @@ typedef struct mm_monitor
 {
   FSEventStreamRef event_stream;
   dispatch_queue_t dispatch_queue;
-  mm_filter **filters;
+  mm_filter *filters;
   char **folders;
   char **processed_files;
   int num_folders;
   int num_filters;
   int num_processed;
+  bool is_running;
+  bool is_stream_valid;
 } mm_monitor;
 
-static mm_monitor media_monitor;
-
-static void check_resize_strarr(char** arr, int *max, int *cur, int add)
+static void
+check_resize_strarr (char **arr, int *max, int *cur, int add)
 {
   if (cur + add > max)
-  {
-    *max *= 2;
-    char **temp = realloc(arr, *max);
-    if (!temp)
     {
-      fprintf(stderr, "realloc failure");
-      exit(EXIT_FAILURE);
+      *max *= 2;
+      char **arr = realloc (arr, *max);
+      if (!arr)
+        {
+          fprintf (stderr, "realloc failure");
+          exit (EXIT_FAILURE);
+        }
     }
-    arr = temp;
-  }
 }
 
 static void
@@ -61,70 +61,47 @@ mm_filter_free (mm_filter *filter)
 static bool
 filter_is_valid_extension (const mm_filter *filter, const char *filename)
 {
-  for (int j = 0; j < filter->num_extensions; j++)
+  for (int i = 0; i < filter->num_extensions; i++)
     {
       char *extension = strrchr (filename, '.');
       // if file does not have valid extension:
       if (!extension || strchr (extension, '/') != NULL)
         continue;
-      if (strcmp (extension, filter->extensions[j]) == 0)
+      if (strcmp (extension, filter->extensions[i]) == 0)
         return true;
     }
   return false;
 }
 
-static int
-mm_monitor_dirent_filter (const struct dirent *entry)
+int
+mm_monitor_filter_file (mm_monitor *monitor, const char *filename)
 {
-  for (int i = 0; i < media_monitor.num_filters; i++)
+  // if already seen, reject:
+  for (int i = 0; i < monitor->num_processed; i++)
     {
-      if (filter_is_valid_extension (media_monitor.filters[i],
-                                     entry->d_name))
+      if (strcmp (monitor->processed_files[i], filename) == 0)
         return 0;
     }
-  // not valid, exclude from list
-  return 1;
-}
 
-// Do actual filetype filtering as well via mm_monitor_dirent_filter
-static char **
-this_dir_scan (char *dir)
-{
-  struct dirent **namelist;
-  int num_entries
-      = scandir (dir, &namelist, mm_monitor_dirent_filter, alphasort);
-  if (num_entries == -1)
-  {
-    perror("scandir failure");
-    exit(EXIT_FAILURE);
-  }
-  char **filtered_names = malloc (num_entries * sizeof (char *));
-  for (int i = 0; i < num_entries; i++)
+  for (int i = 0; i < monitor->num_filters; i++)
     {
-      filtered_names[i] = strdup (namelist[i]->d_name);
-      if (!filtered_names[i])
-        {
-          fprintf (stderr, "strdup failure\n");
-          exit (EXIT_FAILURE);
-        }
+      if (filter_is_valid_extension (&monitor->filters[i], filename))
+        return 1; // valid extension for some filter
     }
-  return filtered_names;
-}
-
-static char **
-full_subdir_scan ()
-{
-  return NULL;
+  // not valid, exclude from list
+  return 0;
 }
 
 // don't need event id for timing yet
+// NOTE also use this to update the tracked ones in monitor, and return those
+// which are new
 static char **
-event_stream_get_new_files (int *num_new_files, size_t numEvents,
-                            char **eventPaths,
+event_stream_get_new_files (mm_monitor *monitor, int *num_new_files,
+                            size_t numEvents, char **eventPaths,
                             const FSEventStreamEventFlags *eventFlags)
 {
   // loop through paths with 'created' flag, check if not found in
-  // media_monitor list 
+  // media_monitor list
   int current_max_size = numEvents;
   char **new_files = malloc (current_max_size * sizeof (char *));
   int cur_new_files = 0;
@@ -139,41 +116,34 @@ event_stream_get_new_files (int *num_new_files, size_t numEvents,
         }
       if (eventFlags[i] & kFSEventStreamEventFlagItemIsFile)
         {
+          // filter filetype
+          if (!mm_monitor_filter_file (monitor, eventPaths[i]))
+            continue;
+
+          // add to processed files list:
+          monitor->processed_files[monitor->num_processed] = strdup (eventPaths[i]);
+          monitor->num_processed++;
+
           // add to new_files:
+          new_files[cur_new_files] = eventPaths[i];
+          cur_new_files++;
+          if (cur_new_files >= current_max_size)
+            {
+              current_max_size *= 2;
+              if (!(new_files = realloc (new_files, current_max_size)))
+                {
+                  fprintf (stderr, "realloc failure");
+                  exit (EXIT_FAILURE);
+                }
+            }
+
           check_resize_strarr (new_files, &current_max_size, &cur_new_files,
                                1);
           new_files[cur_new_files] = eventPaths[i];
           ++cur_new_files;
         }
-      else
-        {
-          // otherwise scan the whole dir: likely not needed with
-          // kFSEventStreamCreateFlagFileEvents
-          char **dir_new_files = NULL;
-          int dir_cur_new_files = 0;
-          if (eventFlags[i] & kFSEventStreamEventFlagMustScanSubDirs)
-            {
-              // nftw() else could use scandir()
-              printf ("subdir scan not yet implemented\n");
-              // dir_new_files = full_subdir_scan ();
-            }
-          else
-            {
-              dir_new_files = this_dir_scan (eventPaths[i]);
-            }
-
-          // append to new_files, grow if necessary
-          check_resize_strarr (new_files, &current_max_size, &cur_new_files,
-                               dir_cur_new_files);
-          // resized, now add the elems
-          for (int j = 0; j < dir_cur_new_files; j++)
-            {
-              new_files[cur_new_files] = dir_new_files[j];
-              ++cur_new_files;
-            }
-        }
     }
-
+  // TODO update tracked files
   *num_new_files = cur_new_files;
   return new_files;
 }
@@ -194,9 +164,10 @@ apply_filter (const mm_filter *filter, char **files, int num_files)
           strcat (prog_and_file, " "); // + 1
           strcat (prog_and_file, files[i]);
           printf ("Running: %s", prog_and_file);
-          if (!system (prog_and_file)) {
-            fprintf(stderr, "program returned nonzero exit status\n");
-          }
+          if (!system (prog_and_file))
+            {
+              fprintf (stderr, "program returned nonzero exit status\n");
+            }
         }
     }
   return 0;
@@ -211,40 +182,47 @@ event_stream_callback (ConstFSEventStreamRef streamRef,
 {
   // loop over events, filter created, and not in already-processed list of
   // media monitor
+  mm_monitor *monitor = (mm_monitor *)clientCallBackInfo;
+
   char **paths = eventPaths;
   int num_new_files;
-  char **new_files = event_stream_get_new_files (&num_new_files, numEvents,
-                                                 paths, eventFlags);
-  printf("New files:\n");
-  for (int i = 0; i < num_new_files; i++) {
-    printf("%s ", new_files[i]);
-  }
-  printf("\n");
-
-  for (int i = 0; i < media_monitor.num_filters; i++)
+  char **new_files = event_stream_get_new_files (monitor, &num_new_files,
+                                                 numEvents, paths, eventFlags);
+  printf ("New files:\n");
+  for (int i = 0; i < num_new_files; i++)
     {
-      apply_filter (media_monitor.filters[i], new_files, num_new_files);
+      printf ("%s ", new_files[i]);
+    }
+  printf ("\n");
+
+  for (int i = 0; i < monitor->num_filters; i++)
+    {
+      apply_filter (&monitor->filters[i], new_files, num_new_files);
     }
 }
 
 static void
-close_event_stream (mm_monitor *monitor)
+mm_monitor_stop (mm_monitor *monitor)
 {
   if (!monitor->event_stream)
+    return;
+  if (!monitor->is_running)
     return;
   FSEventStreamEventId latest_event
       = FSEventStreamGetLatestEventId (monitor->event_stream);
   printf ("Latest event: %llu\n", latest_event);
-
+  printf ("stopping monitor\n");
   FSEventStreamStop (monitor->event_stream);
   FSEventStreamInvalidate (monitor->event_stream);
   FSEventStreamRelease (monitor->event_stream);
+  monitor->is_stream_valid = false;
+  monitor->is_running = false;
 }
 
 static void
 mm_create_update_event_stream (mm_monitor *monitor)
 {
-  close_event_stream (monitor);
+  mm_monitor_stop (monitor);
 
   CFMutableArrayRef paths = CFArrayCreateMutable (NULL, 0, NULL);
   // build CFArray:
@@ -263,28 +241,39 @@ mm_create_update_event_stream (mm_monitor *monitor)
   monitor->event_stream = FSEventStreamCreate (
       NULL, &event_stream_callback, NULL, paths, kFSEventStreamEventIdSinceNow,
       latency, kFSEventStreamCreateFlagFileEvents);
-  // kFSEventStreamCreateFlagNone
+
   FSEventStreamSetDispatchQueue (monitor->event_stream,
                                  monitor->dispatch_queue);
+
+  monitor->is_stream_valid = true;
 }
+
+static int num_created = 0;
+const char dispatch_name[] = "com.asciineuron.mediamonitorqueue";
 
 mm_monitor *
 mm_monitor_init ()
 {
   // TODO static for now, maybe eventually create in-place?
   // everything pointer type so memset ok:
-  memset (&media_monitor, 0, sizeof (media_monitor));
+  mm_monitor *monitor = malloc (sizeof (mm_monitor));
+  memset (monitor, 0, sizeof (mm_monitor));
 
-  media_monitor.folders = malloc (MAX_FOLDERS * sizeof (char *));
-  media_monitor.processed_files = malloc (MAX_FILES * sizeof (char *));
-  media_monitor.filters = malloc (MAX_FILTERS * sizeof (mm_filter *));
+  monitor->folders = malloc (MAX_FOLDERS * sizeof (char *));
+  monitor->processed_files = malloc (MAX_FILES * sizeof (char *));
+  monitor->filters = malloc (MAX_FILTERS * sizeof (mm_filter *));
 
-  media_monitor.dispatch_queue = dispatch_queue_create (
-      "com.asciineuron.mediamonitorqueue", DISPATCH_QUEUE_SERIAL);
+  char numbered_dispatch_name[50];
+  sprintf (numbered_dispatch_name, "%s-%d", dispatch_name, num_created);
+  num_created++;
 
-  mm_create_update_event_stream (&media_monitor);
+  monitor->dispatch_queue
+      = dispatch_queue_create (numbered_dispatch_name, DISPATCH_QUEUE_SERIAL);
 
-  return &media_monitor;
+  mm_create_update_event_stream (monitor);
+  monitor->is_running = false;
+
+  return monitor;
 }
 
 void
@@ -298,7 +287,7 @@ mm_monitor_free (mm_monitor *monitor)
     }
   for (int i = 0; i < monitor->num_filters; i++)
     {
-      mm_filter_free (monitor->filters[i]);
+      mm_filter_free (&monitor->filters[i]);
     }
   for (int i = 0; i < monitor->num_processed; i++)
     {
@@ -309,8 +298,11 @@ mm_monitor_free (mm_monitor *monitor)
 void
 mm_monitor_start (mm_monitor *monitor)
 {
-  // ensure stopped first:
-  mm_monitor_pause (monitor);
+  if (monitor->is_running)
+    return;
+  if (!monitor->is_stream_valid)
+    mm_create_update_event_stream (monitor);
+
   printf ("starting monitor\n");
   if (!FSEventStreamStart (monitor->event_stream))
     {
@@ -322,17 +314,10 @@ mm_monitor_start (mm_monitor *monitor)
 void
 mm_monitor_pause (mm_monitor *monitor)
 {
+  if (!monitor->is_running)
+    return;
   printf ("pausing monitor\n");
   FSEventStreamStop (monitor->event_stream);
-}
-
-void
-mm_monitor_stop (mm_monitor *monitor)
-{
-  printf ("stopping monitor\n");
-  FSEventStreamStop (monitor->event_stream);
-  FSEventStreamInvalidate (monitor->event_stream);
-  FSEventStreamRelease (monitor->event_stream);
 }
 
 void
@@ -377,7 +362,7 @@ mm_monitor_add_filter (mm_monitor *monitor, char *prog_and_args,
   bool found = false;
   for (int i = 0; i < monitor->num_filters; i++)
     {
-      if (strcmp (monitor->filters[i]->prog, prog_and_args) == 0)
+      if (strcmp (monitor->filters[i].prog, prog_and_args) == 0)
         {
           found = true;
           break;
@@ -385,12 +370,15 @@ mm_monitor_add_filter (mm_monitor *monitor, char *prog_and_args,
     }
   if (!found)
     {
-      monitor->filters[monitor->num_filters] = malloc (sizeof (mm_filter *));
-      monitor->filters[monitor->num_filters]->prog = strdup (prog_and_args);
-      monitor->filters[monitor->num_filters]->extensions = malloc (num_extensions * sizeof (char*));
+      // monitor->filters[monitor->num_filters] = malloc (sizeof (mm_filter
+      // *));
+      monitor->filters[monitor->num_filters].prog = strdup (prog_and_args);
+      monitor->filters[monitor->num_filters].extensions
+          = malloc (num_extensions * sizeof (char *));
       for (int i = 0; i < num_extensions; i++)
         {
-          monitor->filters[monitor->num_filters]->extensions[i] = strdup (extensions[i]);
+          monitor->filters[monitor->num_filters].extensions[i]
+              = strdup (extensions[i]);
         }
       monitor->num_filters++;
     }
@@ -404,15 +392,17 @@ mm_monitor_remove_filter (mm_monitor *monitor, char *prog_and_args)
 {
 }
 
-void mm_monitor_print_status(mm_monitor *monitor)
+void
+mm_monitor_print_status (mm_monitor *monitor)
 {
-  printf("Watching folders:\n");
+  printf ("Watching folders:\n");
   for (int i = 0; i < monitor->num_folders; i++)
-  {
-    printf("%s ", monitor->folders[i]);
-  }
-  printf("Filters:\n");
-  for (int i = 0; i < monitor->num_filters; i++) {
-    printf("%s ", monitor->filters[i]->prog);
-  }
+    {
+      printf ("%s ", monitor->folders[i]);
+    }
+  printf ("Filters:\n");
+  for (int i = 0; i < monitor->num_filters; i++)
+    {
+      printf ("%s ", monitor->filters[i].prog);
+    }
 }
