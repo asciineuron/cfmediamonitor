@@ -3,6 +3,8 @@
 #include <dirent.h> // scandir
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <unistd.h>
 
 // #define MM_SOCKET "/tmp/cmediamonitor.sock"
@@ -11,13 +13,6 @@
 #define MAX_FOLDERS 100
 #define MAX_FILTERS 10
 #define MAX_FILES 1000
-
-typedef struct mm_filter
-{
-  char *prog; // all concatenated together
-  char **extensions;
-  int num_extensions;
-} mm_filter;
 
 typedef struct mm_monitor
 {
@@ -252,7 +247,7 @@ static int num_created = 0;
 const char dispatch_name[] = "com.asciineuron.mediamonitorqueue";
 
 mm_monitor *
-mm_monitor_init ()
+mm_monitor_init (void)
 {
   // TODO static for now, maybe eventually create in-place?
   // everything pointer type so memset ok:
@@ -321,7 +316,7 @@ mm_monitor_pause (mm_monitor *monitor)
 }
 
 void
-mm_monitor_add_folders (mm_monitor *monitor, char **folders, int num_folders)
+mm_monitor_add_folders (mm_monitor *monitor, char const *const *folders, int num_folders)
 {
   mm_monitor_stop (monitor);
 
@@ -348,9 +343,24 @@ mm_monitor_add_folders (mm_monitor *monitor, char **folders, int num_folders)
   mm_monitor_start (monitor);
 }
 
+void mm_monitor_change_folder (mm_monitor *monitor, const char *new_folder, int folder_idx)
+{
+  if (folder_idx >= monitor->num_folders) {
+    fprintf(stderr, "folder index %d is out of range for monitor", folder_idx);
+    exit(EXIT_FAILURE);
+  }
+  if (strcmp(new_folder, monitor->folders[folder_idx]) == 0) {
+    return;
+  }
+  free(monitor->folders[folder_idx]);
+  monitor->folders[folder_idx] = strdup(new_folder);
+}
+
 void
 mm_monitor_remove_folders (mm_monitor *monitor, char **folders, int num_folder)
 {
+  // find idx of all that match, remove those and flatten, shift left
+  
 }
 
 void
@@ -372,6 +382,7 @@ mm_monitor_add_filter (mm_monitor *monitor, char *prog_and_args,
     {
       // monitor->filters[monitor->num_filters] = malloc (sizeof (mm_filter
       // *));
+      // TODO check realloc here
       monitor->filters[monitor->num_filters].prog = strdup (prog_and_args);
       monitor->filters[monitor->num_filters].extensions
           = malloc (num_extensions * sizeof (char *));
@@ -385,6 +396,24 @@ mm_monitor_add_filter (mm_monitor *monitor, char *prog_and_args,
 
   mm_create_update_event_stream (monitor);
   mm_monitor_start (monitor);
+}
+
+void mm_monitor_add_filters(mm_monitor *monitor, mm_filter *filter, int num_filters)
+{
+  // skipping checking equality allows adding multiple defaults then editing, maybe we don't want this?
+}
+
+void mm_monitor_change_filter (mm_monitor *monitor, mm_filter *new_filter, int filter_idx)
+{
+  if (filter_idx >= monitor->num_filters)
+  {
+    fprintf(stderr, "folder index %d is out of range for monitor", filter_idx);
+    exit(EXIT_FAILURE);
+  }
+  // skip verifying equality since easier to just re-add
+  mm_filter_free(&monitor->filters[filter_idx]); 
+  // filter is all lightweight pointers, not resources, so copy ok, transferring ownership here, hence no const
+  monitor->filters[filter_idx] = *new_filter;
 }
 
 void
@@ -405,4 +434,52 @@ mm_monitor_print_status (mm_monitor *monitor)
     {
       printf ("%s ", monitor->filters[i].prog);
     }
+}
+
+mm_filter const *
+mm_monitor_get_filters (mm_monitor *monitor, size_t *num_filters)
+{
+  *num_filters = monitor->num_filters;
+  return monitor->filters;
+}
+
+char const *const *
+mm_monitor_get_folders (mm_monitor *monitor, size_t *num_folders)
+{
+  *num_folders = monitor->num_folders;
+  return monitor->folders;
+}
+
+char const *const *
+mm_monitor_get_processed_files (mm_monitor *monitor, size_t *num_processed)
+{
+  *num_processed = monitor->num_processed;
+  return monitor->processed_files;
+}
+
+bool
+mm_filter_is_valid (const mm_filter *filter)
+{
+  // need prog to be real executable file
+  // and each extension to be '.SO.METHI..NG.with.dots\0'
+  struct stat prog_stat;
+  if (stat (filter->prog, &prog_stat))
+    return false;
+  if (!S_ISREG (prog_stat.st_mode))
+    return false;
+  if (!(prog_stat.st_mode & (S_IXUSR | S_IXGRP | S_IXOTH)))
+    return false;
+  // program ok
+
+  for (int i = 0; i < filter->num_extensions; i++)
+    {
+      if ((strcmp (filter->extensions[i], ".") == 0)
+          || (strcmp (filter->extensions[i], "..") == 0))
+        return false;
+      if (filter->extensions[i][0] != '.')
+        return false;
+    }
+  // all valid extensions
+
+  return true;
 }
