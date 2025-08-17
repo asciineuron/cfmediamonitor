@@ -20,167 +20,164 @@
  * strlist_unique_append(monitor->folders, folder);
  * pthread_mutex_unlock(monitor->lock);
  * mm_monitor_update(monitor);
+ *
+ * kCFStringEncodingASCII vs kCFStringEncodingUTF8?
  */
 
 static void die(char *msg)
 {
-	fprintf(stderr, msg);
+	fprintf(stderr, "%s", msg);
 	exit(EXIT_FAILURE);
-}
-
-void strlist_unique_append(struct strlist *list, char *str)
-{
-	if (!list)
-		return;
-	while (list->next != NULL && (strcmp(str, list->str) != 0))
-		list = list->next;
-	if (strcmp(str, list->str) == 0) 
-		return
-	struct strlist *tail = malloc(sizeof(struct strlist));
-	*tail = {.str = strdup(str), .next = NULL};
-	list->next = tail;
-}
-
-struct strlist *strlist_push(struct strlist *list, const char *str)
-{
-	if (!list)
-		return NULL;
-	struct strlist *head = malloc(sizeof(struct strlist));
-	*head = {.str = strdup(str), .next = list};
-	return head;
-	//if (!list)
-	//	return NULL;
-	//struct strlist *last = list;
-	//while (last->next != NULL)
-	//	last = last->next;
-	//struct strlist *pushed = malloc(sizeof(struct strlist));
-	//*pushed = { .str = strdup(str), .next = NULL };
-	//last->next = pushed;
-	//return list;
-}
-
-const char *strlist_get(struct strlist *list, size_t idx)
-{
-	if (!list)
-		return NULL;
-	while (list->next != NULL && idx > 0) {
-		list = list->next;
-		--idx;
-	}
-	if (idx != 0)
-		return NULL;
-	return list->str;
-}
-
-size_t strlist_find(struct strlist *list, const char *search)
-{
-	if (!list)
-		return NULL;
-	size_t idx = 0;
-	while (list->next != NULL && (strcmp(list->str, search) != 0)) {
-		list = list->next;
-		++idx;
-	}
-	if (strcmp(list->str, search) == 0)
-		return idx;
-	return -1;
-}
-
-size_t strlist_len(struct strlist *list)
-{
-	if (!list)
-		return 0;
-	size_t len;
-	while (list->next != NULL) {
-		list = list->next;
-		++len;
-	}
-	return len;
-}
-
-void strlist_free(struct strlist *list)
-{
-	if (!list)
-		return;
-	// NOTE: if on stack, can't free head, so skip first elem and leave to caller
-	struct strlist *tmp = list->next;
-	while (tmp != NULL) {
-		struct strtmp *prev = tmp;
-		tmp = tmp->next;
-		free(prev->str);
-		free(prev);
-		prev = NULL;
-	}
-	list->next = NULL;
 }
 
 void mm_filter_free(struct mm_filter *filter)
 {
-	free(filter->prog);
-	strlist_free(filter->extensions);
-	//free(filter->extensions);
+	CFRelease(filter->prog);
+	for (CFIndex i = 0; i < CFArrayGetCount(filter->extensions); ++i) {
+		CFRelease(CFArrayGetValueAtIndex(filter->extensions, i));
+	}
 }
 
-static bool filter_is_valid_extension(const struct mm_filter *filter,
-				      const char *filename)
+void mm_filter_release_callback(CFAllocatorRef allocator, const void *value)
 {
-	for (int i = 0; i < strlist_len(filter->extensions); i++) {
-		char *extension = strrchr(filename, '.');
+	// TODO : potential problem if held by multiple people and released? Do we need ref count?
+	// shouldn't use array allocator...
+	struct mm_filter *filter = (struct mm_filter *)value;
+	filter->refcount--;
+	if (filter->refcount == 0)
+		mm_filter_free(filter);
+}
+
+const void *mm_filter_retain_callback(CFAllocatorRef allocator,
+				      const void *value)
+{
+	// to respect cf stuff increase retain count so callers don't suddenly get data deleted
+	struct mm_filter *filter = (struct mm_filter *)value;
+	filter->refcount++;
+	CFRetain(filter->prog);
+	for (CFIndex i = 0; i < CFArrayGetCount(filter->extensions); ++i) {
+		CFRetain(CFArrayGetValueAtIndex(filter->extensions, i));
+	}
+	return value;
+}
+
+unsigned char mm_filter_equal_callback(const void *filter1, const void *filter2)
+{
+	struct mm_filter *filter_a = (struct mm_filter *)filter1;
+	struct mm_filter *filter_b = (struct mm_filter *)filter2;
+
+	if (CFStringCompare(filter_a->prog, filter_b->prog, 0) !=
+	    kCFCompareEqualTo)
+		return 0;
+
+	CFIndex len = CFArrayGetCount(filter_a->extensions);
+	if (len != CFArrayGetCount(filter_b->extensions))
+		return 0;
+
+	for (CFIndex i = 0; i < len; i++) {
+		if (CFStringCompare(
+			    CFArrayGetValueAtIndex(filter_a->extensions, i),
+			    CFArrayGetValueAtIndex(filter_b->extensions, i),
+			    0) != kCFCompareEqualTo)
+			return 0;
+	}
+	// prog, extensions length, and each extension all equal
+	return 1;
+}
+
+// defines string repr, equality, release (free),
+// retain (add from ptr so copy or clone), version
+CFArrayCallBacks mm_filter_array_callbacks = {
+	.copyDescription = NULL,
+	.equal = &mm_filter_equal_callback,
+	.release = &mm_filter_release_callback,
+	.retain = &mm_filter_retain_callback,
+	.version = 0
+};
+
+static bool file_has_valid_extension(const struct mm_filter *filter,
+				     CFStringRef filename)
+{
+	const char *filestr =
+		CFStringGetCStringPtr(filename, kCFStringEncodingASCII);
+	// whether filename is some valid extension registered in filter
+	for (CFIndex i = 0; i < CFArrayGetCount(filter->extensions); ++i) {
+		char *extension = strrchr(filestr, '.');
 		// if file does not have valid extension:
 		if (!extension || strchr(extension, '/') != NULL)
 			continue;
-		if (strcmp(extension, strlist_get(filter->extensions, i)) == 0)
-			return true;
+
+		CFStringRef ext_strref = CFArrayGetValueAtIndex(filter->extensions, i);
+		const char *ext = CFStringGetCStringPtr(ext_strref,
+							kCFStringEncodingASCII);
+		if (ext) {
+			if (strcmp(extension, ext) == 0)
+				return true;
+		} else {
+			CFIndex ext_len = CFStringGetLength(ext_strref) + 1; // +1='\0'
+			char *ext = malloc(ext_len);
+			if (!CFStringGetCString(ext_strref, ext, ext_len, kCFStringEncodingASCII))
+				die("unable to obtain extension string");
+			if (strcmp(extension, ext) == 0) {
+				free(ext);
+				return true;
+			}
+			free(ext);
+		}
+
 	}
 	return false;
 }
 
-int mm_monitor_filter_file(mm_monitor *monitor, const char *filename)
+int mm_monitor_filter_file(mm_monitor *monitor, CFStringRef filename)
 {
 	// if already seen, reject:
-	for (int i = 0; i < strlist_len(monitor->processed_files); i++) {
-		if (strcmp(strlist_get(monitor->processed_files, i),
-			   filename) == 0)
+	if (CFArrayContainsValue(
+		    monitor->processed_files,
+		    CFRangeMake(0, CFArrayGetCount(monitor->processed_files)),
+		    filename))
+		return 0;
+
+	for (CFIndex i = 0; i < CFArrayGetCount(monitor->filters); ++i) {
+		if (file_has_valid_extension(
+			    CFArrayGetValueAtIndex(monitor->filters, i),
+			    filename))
 			return 0;
 	}
-
-	for (int i = 0; i < monitor->num_filters; i++) {
-		if (filter_is_valid_extension(&monitor->filters[i], filename))
-			return 1; // valid extension for some filter
-	}
 	// not valid, exclude from list
-	return 0;
+	return -1;
 }
 
 // don't need event id for timing yet
 // NOTE also use this to update the tracked ones in monitor, and return those
 // which are new
-static struct strlist *
+static CFArrayRef
 event_stream_get_new_files(mm_monitor *monitor, size_t numEvents,
-			   char **eventPaths,
+			   CFArrayRef eventPaths,
 			   const FSEventStreamEventFlags *eventFlags)
 {
 	// loop through paths with 'created' flag, check if not found in
 	// media_monitor list
-	struct strlist *new_files = malloc(sizeof(struct strlist));
+	CFMutableArrayRef new_files = CFArrayCreateMutable(NULL, 0, NULL);
 
 	for (int i = 0; i < numEvents; i++) {
-		printf("handling %s\n", eventPaths[i]);
+		CFShow(CFSTR("handling:\n"));
+		CFShow(CFArrayGetValueAtIndex(eventPaths, i));
 		if (!(eventFlags[i] & kFSEventStreamEventFlagItemCreated)) {
-			printf("not a file created event...\n");
+			CFShow(CFSTR("not a file created event...\n"));
 			continue;
 		}
 
 		if (eventFlags[i] & kFSEventStreamEventFlagItemIsFile) {
+			CFStringRef path =
+				CFArrayGetValueAtIndex(eventPaths, i);
+
 			// filter filetype
-			if (!mm_monitor_filter_file(monitor, eventPaths[i]))
+			if (mm_monitor_filter_file(monitor, path))
 				continue;
 
-			// add to processed files list:
-			strlist_push(monitor->processed_files, eventPaths[i]);
-			// add to new_files:
-			strlist_push(new_files, eventPaths[i]);
-			free(eventPaths[i]); // do we own this?
+			CFArrayAppendValue(monitor->processed_files, path);
+			CFArrayAppendValue(new_files, path);
 		}
 	}
 	// TODO update tracked files
@@ -189,24 +186,29 @@ event_stream_get_new_files(mm_monitor *monitor, size_t numEvents,
 
 // expects files to be realpath'd already
 //static int apply_filter(const mm_filter *filter, char **files, int num_files)
-static int apply_filter(const struct mm_filter *filter, const struct strlist *files)
+static int apply_filter(const struct mm_filter *filter, CFArrayRef files)
 {
 	bool failed = false;
-	for (struct strlist *file = files; file != NULL; file = file->next) {
-		const char *filestr = file->str;
-		if (filter_is_valid_extension(filter, filestr)) {
+	for (CFIndex i = 0; i < CFArrayGetCount(files); ++i) {
+		CFStringRef file = CFArrayGetValueAtIndex(files, i);
+		const char *filestr =
+			CFStringGetCStringPtr(file, kCFStringEncodingASCII);
+		if (file_has_valid_extension(filter, file)) {
 			// extension match for this file, execute:
-			// NOTE only on one file at a time for now
-			char *prog_and_file = malloc(
-				sizeof(char) *
-				(1 + strlen(filter->prog) + strlen(filestr)));
-			strcpy(prog_and_file, filter->prog);
-			strcat(prog_and_file, " "); // + 1
-			strcat(prog_and_file, filestr);
-			printf("Running: %s", prog_and_file);
-			if (!system(prog_and_file)) {
+			// TODO combine all in one swoop instead so prog files... vs prog file prog file...
+			CFMutableStringRef prog_and_file =
+				CFStringCreateMutable(NULL, 0);
+			CFStringAppend(prog_and_file, filter->prog);
+			CFStringAppend(prog_and_file, CFSTR(" "));
+			CFStringAppend(prog_and_file, file);
+
+			const char *cstr = CFStringGetCStringPtr(
+				prog_and_file, kCFStringEncodingASCII);
+			printf("Running: '%s'\n", cstr);
+			int result = system(cstr);
+			if (result) {
 				fprintf(stderr,
-					"program returned nonzero exit status\n");
+					"program returned nonzero exit status: %d\n", result);
 				failed = true;
 			}
 			free(prog_and_file);
@@ -225,23 +227,23 @@ static void event_stream_callback(ConstFSEventStreamRef streamRef,
 	// media monitor
 	mm_monitor *monitor = (mm_monitor *)clientCallBackInfo;
 
-	char **paths = eventPaths;
-	int num_new_files;
-	struct strlist *new_files = event_stream_get_new_files(monitor, numEvents, paths,
-						      eventFlags);
-	printf("New files:\n");
-	for (int i = 0; i < num_new_files; i++) {
-		printf("%s ", new_files[i]);
+	//char **paths = eventPaths;
+	CFArrayRef paths = (CFArrayRef)eventPaths;
+	CFArrayRef new_files = event_stream_get_new_files(monitor, numEvents,
+							  paths, eventFlags);
+	CFShow(CFSTR("New files:\n"));
+	for (CFIndex i = 0; i < CFArrayGetCount(new_files); ++i) {
+		CFShow(CFArrayGetValueAtIndex(new_files, i));
 	}
-	printf("\n");
+	CFShow(CFSTR("\n"));
 
-	for (int i = 0; i < monitor->num_filters; i++) {
-		apply_filter(&monitor->filters[i], new_files, num_new_files);
+	for (CFIndex i = 0; i < CFArrayGetCount(monitor->filters); ++i) {
+		apply_filter((const struct mm_filter *)(CFArrayGetValueAtIndex(
+				     monitor->filters, i)),
+			     new_files);
 	}
 
-	strlist_free(new_files);
-	// need to free heap head separately
-	free(new_files);
+	CFRelease(new_files);
 }
 
 static void mm_monitor_stop(mm_monitor *monitor)
@@ -263,39 +265,55 @@ static void mm_monitor_stop(mm_monitor *monitor)
 
 static void mm_create_update_event_stream(mm_monitor *monitor)
 {
+	if (CFArrayGetCount(monitor->folders) == 0)
+		return;
+
 	mm_monitor_stop(monitor);
 
-	CFMutableArrayRef paths = CFArrayCreateMutable(NULL, 0, NULL);
-	// build CFArray:
-	pthread_mutex_lock(&monitor->lock);
-	for (int i = 0; i < monitor->num_folders; i++) {
-		CFStringRef folder = CFStringCreateWithCString(
-			kCFAllocatorDefault, monitor->folders[i],
-			kCFStringEncodingUTF8);
+	//CFMutableArrayRef paths = CFArrayCreateMutable(NULL, 0, NULL);
+	//// build CFArray:
+	//pthread_mutex_lock(&monitor->lock);
+	//for (CFIndex i = 0; i < CFArrayGetCount(monitor->folders); ++i) {
+	//	CFStringRef folder = CFArrayGetValueAtIndex(monitor->folders, i);
 
-		CFArrayAppendValue(paths, folder);
-	}
-	pthread_mutex_unlock(&monitor->lock);
+	//	CFArrayAppendValue(paths, folder);
+	//}
+	//pthread_mutex_unlock(&monitor->lock);
+	//printf("paths:\n");
+	//CFShow(paths);
+	//CFShow(CFAllocatorGetDefault());
 
 	CFAbsoluteTime latency = 3.0;
 	// TODO track time and not just since now. First, just process things
 	// incoming while currently running, compare against found file names, no
 	// timestamp necessary
+	// kFSEventStreamCreateFlagUseCFTypes makes eventPaths
+	// CFArrayRef of CFStringRef which are released on callback exit
+	// TODO add context pointer whose info points to this monitor object
+	pthread_mutex_lock(&monitor->lock);
+	fprintf(stderr, "int folders");
+	CFShow(monitor->folders);
+	FSEventStreamContext monitor_context = { .copyDescription = NULL,
+						 .info = monitor,
+						 .release = NULL,
+						 .retain = NULL,
+						 .version = 0 };
 	monitor->event_stream =
-		FSEventStreamCreate(NULL, &event_stream_callback, NULL, paths,
+		FSEventStreamCreate(NULL, &event_stream_callback, &monitor_context, monitor->folders,
 				    kFSEventStreamEventIdSinceNow, latency,
-				    kFSEventStreamCreateFlagFileEvents);
+				    kFSEventStreamCreateFlagFileEvents |
+					    kFSEventStreamCreateFlagUseCFTypes);
+	if (!monitor->event_stream)
+		die("failed to create event stream");
+	else
+		CFShow(CFSTR("successfully created event stream"));
+
+	pthread_mutex_unlock(&monitor->lock);
 
 	FSEventStreamSetDispatchQueue(monitor->event_stream,
 				      monitor->dispatch_queue);
-
+	//CFRelease(paths);
 	monitor->is_stream_valid = true;
-}
-
-
-void mm_monitor_update(mm_monitor *monitor)
-{
-	mm_create_update_event_stream(monitor);
 }
 
 static int num_created = 0;
@@ -308,9 +326,12 @@ mm_monitor *mm_monitor_init(void)
 	mm_monitor *monitor = malloc(sizeof(mm_monitor));
 	memset(monitor, 0, sizeof(mm_monitor));
 
-	monitor->folders = malloc(MAX_FOLDERS * sizeof(char *));
-	monitor->processed_files = malloc(MAX_FILES * sizeof(char *));
-	monitor->filters = malloc(MAX_FILTERS * sizeof(struct mm_filter *));
+	monitor->folders =
+		CFArrayCreateMutable(NULL, 0, &kCFTypeArrayCallBacks);
+	monitor->processed_files =
+		CFArrayCreateMutable(NULL, 0, &kCFTypeArrayCallBacks);
+
+	monitor->filters = CFArrayCreateMutable(NULL, 0, &mm_filter_array_callbacks);
 
 	char numbered_dispatch_name[50];
 	sprintf(numbered_dispatch_name, "%s-%d", dispatch_name, num_created);
@@ -319,10 +340,11 @@ mm_monitor *mm_monitor_init(void)
 	monitor->dispatch_queue = dispatch_queue_create(numbered_dispatch_name,
 							DISPATCH_QUEUE_SERIAL);
 
-	pthread_mutex_init(monitor->lock, NULL);
+	pthread_mutex_init(&monitor->lock, NULL);
 
-	mm_create_update_event_stream(monitor);
-	monitor->is_running = false;
+	//monitor->is_running = false;
+	//monitor->is_stream_valid = false;
+	//mm_create_update_event_stream(monitor);
 
 	return monitor;
 }
@@ -332,15 +354,11 @@ void mm_monitor_free(mm_monitor *monitor)
 	mm_monitor_stop(monitor);
 	dispatch_release(monitor->dispatch_queue);
 	pthread_mutex_lock(&monitor->lock);
-	for (int i = 0; i < monitor->num_folders; i++) {
-		free(monitor->folders[i]);
-	}
-	for (int i = 0; i < monitor->num_filters; i++) {
-		mm_filter_free(&monitor->filters[i]);
-	}
-	for (int i = 0; i < monitor->num_processed; i++) {
-		free(monitor->processed_files[i]);
-	}
+
+	CFRelease(monitor->folders);
+	CFRelease(monitor->filters);
+	CFRelease(monitor->processed_files);
+
 	pthread_mutex_unlock(&monitor->lock);
 	pthread_mutex_destroy(&monitor->lock);
 }
@@ -352,7 +370,7 @@ void mm_monitor_start(mm_monitor *monitor)
 	if (!monitor->is_stream_valid)
 		mm_create_update_event_stream(monitor);
 
-	printf("starting monitor\n");
+	CFShow(CFSTR("starting monitor\n"));
 	if (!FSEventStreamStart(monitor->event_stream)) {
 		fprintf(stderr, "failed to start event stream\n");
 		exit(EXIT_FAILURE);
@@ -363,7 +381,7 @@ void mm_monitor_pause(mm_monitor *monitor)
 {
 	if (!monitor->is_running)
 		return;
-	printf("pausing monitor\n");
+	CFShow(CFSTR("pausing monitor\n"));
 	FSEventStreamStop(monitor->event_stream);
 }
 
@@ -375,66 +393,70 @@ void mm_monitor_update(mm_monitor *monitor)
 		mm_monitor_start(monitor);
 }
 
-static char *str_resize(char *str, int testlen, int alloc)
-{
-	if (testlen >= alloc) {
-		alloc *= 2;
-		if (!(str = realloc(str, alloc)))
-			die("realloc failure");
-	}
-	return str;
-}
+//static char *str_resize(char *str, int testlen, int alloc)
+//{
+//	if (testlen >= alloc) {
+//		alloc *= 2;
+//		if (!(str = realloc(str, alloc)))
+//			die("realloc failure");
+//	}
+//	return str;
+//}
 
-char *mm_monitor_print_status(mm_monitor *monitor)
-{
-	pthread_mutex_lock(&monitor->lock);
-	int alloc = 1000;
-	char *output = malloc(alloc);
-	int len = 0;
-	len += sprintf(output, "Watching folders:\n");
-
-	for (struct strlist *folder = monitor->folders; folder != NULL;
-	     folder = folder->next) {
-		const char *folderstr = folder->str;
-		output = str_resize(output, strlen(folderstr) + 1 + len, alloc);
-		len += snprintf(output, alloc - len, "%s\n",
-				monitor->folders[i]);
-	}
-
-	const char[] filter_header = "Filters:\nprog\nextensions";
-	if (strlen(filter_header) + len >= alloc) {
-		alloc += 1000;
-		if (!(output = realloc(output, alloc)))
-			die("realloc failure");
-	}
-	len += sprintf(output, filter_header);
-
-	for (int i = 0; i < monitor->num_filters; i++) {
-		struct mm_filter *filter = monitor->filters[i];
-		output = str_resize(output, strlen(filter.prog) + 2 + len,
-				    alloc); // 2 = \n\n
-		len += snprintf(output, alloc - len, "\n%s\n", filter->prog);
-
-		for (struct strlist *ext = filter->extensions; ext != NULL;
-		     ext = ext->next) {
-			const char *extstr = ext->str;
-			output = str_resize(output, strlen(extstr) + 1 + len,
-					    alloc);
-			len += snprintf(output, alloc - len, "%s ", extstr);
-		}
-	}
-
-	pthread_mutex_unlock(&monitor->lock);
-	output[len] = '\0';
-	return output;
-}
+//char *mm_monitor_print_status(mm_monitor *monitor)
+//{
+//	pthread_mutex_lock(&monitor->lock);
+//	int alloc = 1000;
+//	char *output = malloc(alloc);
+//	int len = 0;
+//	len += sprintf(output, "Watching folders:\n");
+//
+//	for (struct strlist *folder = monitor->folders; folder != NULL;
+//	     folder = folder->next) {
+//		const char *folderstr = folder->str;
+//		output = str_resize(output, strlen(folderstr) + 1 + len, alloc);
+//		len += snprintf(output, alloc - len, "%s\n",
+//				monitor->folders[i]);
+//	}
+//
+//	const char[] filter_header = "Filters:\nprog\nextensions";
+//	if (strlen(filter_header) + len >= alloc) {
+//		alloc += 1000;
+//		if (!(output = realloc(output, alloc)))
+//			die("realloc failure");
+//	}
+//	len += sprintf(output, filter_header);
+//
+//	for (int i = 0; i < monitor->num_filters; i++) {
+//		struct mm_filter *filter = monitor->filters[i];
+//		output = str_resize(output, strlen(filter.prog) + 2 + len,
+//				    alloc); // 2 = \n\n
+//		len += snprintf(output, alloc - len, "\n%s\n", filter->prog);
+//
+//		for (struct strlist *ext = filter->extensions; ext != NULL;
+//		     ext = ext->next) {
+//			const char *extstr = ext->str;
+//			output = str_resize(output, strlen(extstr) + 1 + len,
+//					    alloc);
+//			len += snprintf(output, alloc - len, "%s ", extstr);
+//		}
+//	}
+//
+//	pthread_mutex_unlock(&monitor->lock);
+//	output[len] = '\0';
+//	return output;
+//}
 
 bool mm_filter_is_valid(const struct mm_filter *filter)
 {
 	// need prog to be real executable file
 	// and each extension to be '.SO.METHI..NG.with.dots\0'
 	struct stat prog_stat;
-	if (stat(filter->prog, &prog_stat))
+	const char *prog =
+		CFStringGetCStringPtr(filter->prog, kCFStringEncodingASCII);
+	if (!prog)
+		die("CFStringGetCStringPtr fail, consider CFStringGetCString");
+	if (stat(prog, &prog_stat))
 		return false;
 	if (!S_ISREG(prog_stat.st_mode))
 		return false;
@@ -442,11 +464,13 @@ bool mm_filter_is_valid(const struct mm_filter *filter)
 		return false;
 	// program ok
 
-	for (int i = 0; i < filter->num_extensions; i++) {
-		if ((strcmp(filter->extensions[i], ".") == 0) ||
-		    (strcmp(filter->extensions[i], "..") == 0))
+	for (CFIndex i = 0; i < CFArrayGetCount(filter->extensions); ++i) {
+		const char *ext = CFStringGetCStringPtr(
+			CFArrayGetValueAtIndex(filter->extensions, i),
+			kCFStringEncodingASCII);
+		if ((strcmp(ext, ".") == 0) || (strcmp(ext, "..") == 0))
 			return false;
-		if (filter->extensions[i][0] != '.')
+		if (ext[0] != '.')
 			return false;
 	}
 	// all valid extensions

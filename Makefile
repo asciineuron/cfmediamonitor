@@ -1,5 +1,5 @@
 CFLAGS = -DDEBUG -g
-LDFLAGS = -framework CoreServices
+LDFLAGS = -framework CoreServices -framework CoreFoundation -lpthread
 
 SRC = main.c mediamonitor.c
 OBJ = ${SRC:.c=.o}
